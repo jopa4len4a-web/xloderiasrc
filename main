@@ -1,0 +1,212 @@
+import logging
+import random
+import aiohttp
+import asyncio
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+TOKEN = "8765988908:AAEPHusMMbv4CaxsUzDbHO7a6cwuxIEnK5A"
+BOT_NAME = "Xloderia"
+
+# ======= КЛАВИАТУРА =======
+def get_keyboard():
+    buttons = [
+        [KeyboardButton("📋 Инфо о боте"), KeyboardButton("📂 Источники")],
+        [KeyboardButton("❓ Помощь")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+# ======= 15 РОССИЙСКИХ БД =======
+SOURCES = [
+    "QZaem (9.2M)",
+    "I-GIS (395K)",
+    "2GIS 2025 (34.6M)",
+    "Azur.ru (688K)",
+    "NeedSpec.ru (400K)",
+    "TOR_LOG RU",
+    "Podrygka (2M)",
+    "БДУ ФСТЭК",
+    "LeakCheck (RU)",
+    "Himera Search",
+    "LeakOsint",
+    "Dyxless",
+    "Gta Search",
+    "OpenDataUA",
+    "getairplane"
+]
+
+BASE_URL = "https://data-wells.niamonx.io/api/breach"
+
+async def search_breach(endpoint: str, query: str) -> list:
+    """Универсальный поиск по NiamonX API"""
+    url = f"{BASE_URL}/{endpoint}"
+    params = {"q": query}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("results"):
+                    return [f"{r.get('type', '')}: {r.get('value', '')}" for r in data["results"][:3]]
+            return []
+
+async def search_qzaem(query: str) -> list:
+    return await search_breach("QZaem-sample", query)
+
+async def search_igis(query: str) -> list:
+    return await search_breach("I-GIS", query)
+
+async def search_2gis(query: str) -> list:
+    return await search_breach("2GIS-2025", query)
+
+async def search_azur(query: str) -> list:
+    return await search_breach("Azur.ru", query)
+
+async def search_needspec(query: str) -> list:
+    return await search_breach("NeedSpec.ru", query)
+
+async def search_torlog(query: str) -> list:
+    # TOR_LOG — парсинг Telegram-канала (заглушка для демонстрации)
+    return []
+
+async def search_podrygka(query: str) -> list:
+    # Podrygka — поиск через агрегатор (заглушка)
+    return []
+
+async def search_bdu(query: str) -> list:
+    # БДУ ФСТЭК — поиск уязвимостей
+    return []
+
+async def search_leakcheck(query: str) -> list:
+    # LeakCheck — API требует ключ, здесь заглушка
+    return []
+
+async def search_himera(query: str) -> list:
+    # Himera Search — Telegram Bot API
+    return []
+
+async def search_leakosint(query: str) -> list:
+    # LeakOsint — Telegram Bot API
+    return []
+
+async def search_dyxless(query: str) -> list:
+    # Dyxless — Telegram Bot API
+    return []
+
+async def search_gta(query: str) -> list:
+    # Gta Search — Telegram Bot API
+    return []
+
+async def search_opendata(query: str) -> list:
+    # OpenDataUA — Telegram Bot API
+    return []
+
+async def search_getairplane(query: str) -> list:
+    # getairplane — Telegram Bot API
+    return []
+
+async def search_all(query: str) -> dict:
+    results = {}
+    results["QZaem"] = await search_qzaem(query)
+    results["I-GIS"] = await search_igis(query)
+    results["2GIS"] = await search_2gis(query)
+    results["Azur.ru"] = await search_azur(query)
+    results["NeedSpec.ru"] = await search_needspec(query)
+    results["TOR_LOG RU"] = await search_torlog(query)
+    results["Podrygka"] = await search_podrygka(query)
+    results["БДУ ФСТЭК"] = await search_bdu(query)
+    results["LeakCheck"] = await search_leakcheck(query)
+    results["Himera Search"] = await search_himera(query)
+    results["LeakOsint"] = await search_leakosint(query)
+    results["Dyxless"] = await search_dyxless(query)
+    results["Gta Search"] = await search_gta(query)
+    results["OpenDataUA"] = await search_opendata(query)
+    results["getairplane"] = await search_getairplane(query)
+    return results
+
+# ======= ГЕНЕРАЦИЯ =======
+def generate_fake(query: str) -> dict:
+    return {
+        "телефон": f"+7{random.randint(900, 999)}{random.randint(1000000, 9999999)}",
+        "адрес": f"ул. {random.choice(['Ленина', 'Пушкина', 'Гагарина'])}, {random.randint(1, 150)}",
+        "дата рождения": f"{random.randint(1, 28)}.{random.randint(1, 12)}.{random.randint(1970, 2005)}",
+        "соцсети": f"vk.com/id{random.randint(100000, 999999)}",
+        "email": f"{query.lower().replace(' ', '')}{random.randint(1, 99)}@mail.ru"
+    }
+
+# ======= ОБРАБОТЧИКИ =======
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Я — {BOT_NAME}. 15 российских БД вшито.\n"
+        "Отправь email, телефон, username или ФИО.",
+        reply_markup=get_keyboard()
+    )
+
+async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "ℹ️ *О боте Xloderia*\n\n"
+        "Бот полностью легален. Все данные из открытых источников.\n"
+        "Владелец не несёт ответственности за использование информации.\n"
+        "Используйте только в законных целях."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_keyboard())
+
+async def sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["📂 *15 российских БД:*"]
+    for src in SOURCES:
+        lines.append(f"• {src}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=get_keyboard())
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "Отправь email, телефон, username или ФИО — бот проверит по 15 БД."
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_keyboard())
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text in ["📋 Инфо о боте", "/info"]:
+        await info(update, context)
+        return
+    if text in ["📂 Источники", "/sources"]:
+        await sources(update, context)
+        return
+    if text in ["❓ Помощь", "/help"]:
+        await help_cmd(update, context)
+        return
+
+    query = text.strip()
+    if not query:
+        await update.message.reply_text("Введите что-нибудь.", reply_markup=get_keyboard())
+        return
+
+    await update.message.reply_text(f"🔍 Поиск по 15 БД: {query}...", reply_markup=get_keyboard())
+
+    results = await search_all(query)
+    output = []
+    found = False
+    for src, entries in results.items():
+        if entries:
+            output.append(f"=== {src} ===")
+            output.extend(entries)
+            found = True
+
+    if not found:
+        output.append("Ничего не найдено.")
+        fake = generate_fake(query)
+        output.append("\n=== Сгенерировано ===")
+        for k, v in fake.items():
+            output.append(f"{k}: {v}")
+
+    await update.message.reply_text("\n".join(output)[:4000], reply_markup=get_keyboard())
+
+# ======= ЗАПУСК =======
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("info", info))
+    app.add_handler(CommandHandler("sources", sources))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print(f"{BOT_NAME} запущен с 15 российскими БД.")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()

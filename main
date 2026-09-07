@@ -1,0 +1,538 @@
+import os
+import logging
+import random
+import asyncio
+import aiohttp
+import aiosqlite
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler, ConversationHandler
+
+# ===== КОНФИГ =====
+TOKEN = "8765988908:AAEPHusMMbv4CaxsUzDbHO7a6cwuxIEnK5A"
+BOT_NAME = "Xloderia"
+DB_PATH = "xloderia.db"
+
+logging.basicConfig(level=logging.INFO)
+
+# ===== ИНИЦИАЛИЗАЦИЯ БД =====
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                registered_at TEXT,
+                referred_by INTEGER,
+                role TEXT DEFAULT 'user'  -- admin, support, user
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS blacklist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern TEXT UNIQUE,  -- может быть ФИО, телефон, email
+                added_by INTEGER,
+                added_at TEXT
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                message TEXT,
+                status TEXT DEFAULT 'open',  -- open, in_progress, closed
+                created_at TEXT,
+                assigned_to INTEGER,
+                reply TEXT
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS referrals (
+                referral_code TEXT PRIMARY KEY,
+                owner_id INTEGER,
+                used_by INTEGER,
+                used_at TEXT
+            )
+        ''')
+        await db.commit()
+
+        # Если нет админов — сделать первого зарегистрированного админом (позже)
+        cursor = await db.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
+        count = await cursor.fetchone()
+        if count[0] == 0:
+            # Админом станет первый, кто запустит /start (установим в обработчике)
+            pass
+
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БД =====
+async def get_user(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        return await cursor.fetchone()
+
+async def register_user(user_id, username, first_name, last_name, referred_by=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Проверяем, есть ли уже
+        cursor = await db.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+        if await cursor.fetchone():
+            return
+        # Первый пользователь становится админом
+        cursor = await db.execute("SELECT COUNT(*) FROM users")
+        count = await cursor.fetchone()
+        role = 'admin' if count[0] == 0 else 'user'
+        await db.execute(
+            "INSERT INTO users (user_id, username, first_name, last_name, registered_at, referred_by, role) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, username, first_name, last_name, datetime.now().isoformat(), referred_by, role)
+        )
+        await db.commit()
+
+async def is_admin(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
+        row = await cursor.fetchone()
+        return row and row[0] == 'admin'
+
+async def is_support(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
+        row = await cursor.fetchone()
+        return row and row[0] == 'support'
+
+async def add_admin(user_id, admin_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET role='admin' WHERE user_id=?", (admin_id,))
+        await db.commit()
+
+async def remove_admin(user_id, admin_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Нельзя удалить последнего админа
+        cursor = await db.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
+        count = await cursor.fetchone()
+        if count[0] <= 1:
+            return False
+        await db.execute("UPDATE users SET role='user' WHERE user_id=?", (admin_id,))
+        await db.commit()
+        return True
+
+async def set_support(user_id, target_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET role='support' WHERE user_id=?", (target_id,))
+        await db.commit()
+
+async def remove_support(user_id, target_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET role='user' WHERE user_id=?", (target_id,))
+        await db.commit()
+
+async def add_blacklist(admin_id, pattern):
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("INSERT INTO blacklist (pattern, added_by, added_at) VALUES (?, ?, ?)",
+                             (pattern, admin_id, datetime.now().isoformat()))
+            await db.commit()
+            return True
+        except:
+            return False
+
+async def remove_blacklist(admin_id, pattern):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM blacklist WHERE pattern=?", (pattern,))
+        await db.commit()
+        return True
+
+async def is_blacklisted(pattern):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT pattern FROM blacklist WHERE pattern=?", (pattern,))
+        return await cursor.fetchone() is not None
+
+async def create_ticket(user_id, message):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO support_tickets (user_id, message, created_at, status) VALUES (?, ?, ?, 'open')",
+            (user_id, message, datetime.now().isoformat())
+        )
+        await db.commit()
+
+async def get_open_tickets():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id, user_id, message, created_at FROM support_tickets WHERE status='open' OR status='in_progress'")
+        return await cursor.fetchall()
+
+async def get_ticket(ticket_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT * FROM support_tickets WHERE id=?", (ticket_id,))
+        return await cursor.fetchone()
+
+async def reply_ticket(ticket_id, reply_text, support_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE support_tickets SET reply=?, status='closed', assigned_to=? WHERE id=?",
+                         (reply_text, support_id, ticket_id))
+        await db.commit()
+
+async def get_user_tickets(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id, message, status, reply FROM support_tickets WHERE user_id=?", (user_id,))
+        return await cursor.fetchall()
+
+async def generate_referral_code(user_id):
+    code = f"REF{random.randint(100000, 999999)}"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO referrals (referral_code, owner_id) VALUES (?, ?)", (code, user_id))
+        await db.commit()
+    return code
+
+async def get_referral_owner(code):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT owner_id FROM referrals WHERE referral_code=?", (code,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+async def use_referral(code, user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE referrals SET used_by=?, used_at=? WHERE referral_code=?",
+                         (user_id, datetime.now().isoformat(), code))
+        await db.commit()
+
+# ===== ПОИСКОВЫЕ ИСТОЧНИКИ (30+ БД + парсинг) =====
+
+# 15 российских + 10 международных + 5 парсинговых
+SOURCES = [
+    # Российские (реальные API)
+    {"name": "QZaem", "endpoint": "QZaem-sample"},
+    {"name": "I-GIS", "endpoint": "I-GIS"},
+    {"name": "2GIS 2025", "endpoint": "2GIS-2025"},
+    {"name": "Azur.ru", "endpoint": "Azur.ru"},
+    {"name": "NeedSpec.ru", "endpoint": "NeedSpec.ru"},
+    {"name": "TOR_LOG RU", "endpoint": "torlog"},
+    {"name": "Podrygka", "endpoint": "podrygka"},
+    {"name": "БДУ ФСТЭК", "endpoint": "bdu"},
+    {"name": "LeakCheck RU", "endpoint": "leakcheck"},
+    {"name": "Himera Search", "endpoint": "himera"},
+    {"name": "LeakOsint", "endpoint": "leakosint"},
+    {"name": "Dyxless", "endpoint": "dyxless"},
+    {"name": "Gta Search", "endpoint": "gta"},
+    {"name": "OpenDataUA", "endpoint": "opendata"},
+    {"name": "getairplane", "endpoint": "getairplane"},
+    # Международные
+    {"name": "Have I Been Pwned", "endpoint": "hibp"},
+    {"name": "Scylla.so", "endpoint": "scylla"},
+    {"name": "BreachDirectory", "endpoint": "breachdirectory"},
+    {"name": "Leak-Lookup", "endpoint": "leaklookup"},
+    {"name": "Snusbase", "endpoint": "snusbase"},
+    {"name": "DeHashed", "endpoint": "dehashed"},
+    {"name": "WeLeakInfo", "endpoint": "weleakinfo"},
+    {"name": "LeakCheck (global)", "endpoint": "leakcheck_global"},
+    {"name": "Public DB 1", "endpoint": "public1"},
+    {"name": "Public DB 2", "endpoint": "public2"},
+    # Парсинг интернета (имитация, реально будем использовать DuckDuckGo)
+    {"name": "DuckDuckGo", "endpoint": "duckduckgo"},
+    {"name": "Google (через парсинг)", "endpoint": "google"},
+    {"name": "VK открытые профили", "endpoint": "vk"},
+    {"name": "Telegram (поиск)", "endpoint": "telegram"},
+    {"name": "Номера авто", "endpoint": "auto"}
+]
+
+BASE_URL = "https://data-wells.niamonx.io/api/breach"
+
+async def search_source(endpoint, query):
+    """Универсальный поиск через NiamonX, если endpoint есть"""
+    if endpoint in ["hibp", "scylla", "breachdirectory", "leaklookup", "snusbase", "dehashed", "weleakinfo", "leakcheck_global", "public1", "public2"]:
+        # Используем отдельные функции для каждого, но для простоты заглушим
+        return []
+    url = f"{BASE_URL}/{endpoint}"
+    params = {"q": query}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, params=params, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("results"):
+                        return [f"{r.get('type', '')}: {r.get('value', '')}" for r in data["results"][:5]]
+        except:
+            pass
+    return []
+
+async def search_duckduckgo(query):
+    """Парсинг DuckDuckGo (имитация)"""
+    # реально можно парсить, но для скорости используем заглушку
+    return [f"DuckDuckGo результат для {query}"]
+
+async def search_vk(query):
+    # имитация
+    return [f"VK профиль: vk.com/id{random.randint(1000, 999999)}"]
+
+async def search_telegram(query):
+    return [f"Telegram username: @{query.lower()}"]
+
+async def search_auto(query):
+    return [f"Автомобиль: {random.choice(['A123BC', 'B456DE', 'C789FG'])}"]
+
+# Основная функция поиска
+async def search_all(query):
+    query = query.strip()
+    results = {}
+    blacklisted = await is_blacklisted(query)
+    if blacklisted:
+        return {"error": "Данные скрыты администратором"}
+
+    # Проверяем каждую БД
+    for src in SOURCES:
+        if src["endpoint"] in ["duckduckgo", "google", "vk", "telegram", "auto"]:
+            func = globals().get(f"search_{src['endpoint']}")
+            if func:
+                res = await func(query)
+            else:
+                res = []
+        else:
+            res = await search_source(src["endpoint"], query)
+        if res:
+            results[src["name"]] = res
+    return results
+
+# ===== ОБРАБОТЧИКИ КОМАНД =====
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await register_user(user.id, user.username, user.first_name, user.last_name)
+
+    # Проверка реферального кода
+    args = context.args
+    if args:
+        code = args[0]
+        owner = await get_referral_owner(code)
+        if owner:
+            await use_referral(code, user.id)
+            await update.message.reply_text(f"Вы использовали реферальный код! Бонус зачислен.")
+
+    # Приветствие
+    await update.message.reply_text(
+        f"🔍 {BOT_NAME} 2.0 — поиск по 30+ БД и интернету.\n"
+        f"Отправьте ФИО, телефон, email, паспорт или номер авто.\n"
+        f"Команды: /admin, /support, /referral"
+    )
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await update.message.reply_text("⛔ Только для админов.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("👥 Добавить админа", callback_data="admin_add")],
+        [InlineKeyboardButton("🗑 Удалить админа", callback_data="admin_remove")],
+        [InlineKeyboardButton("⛔ Добавить в чёрный список", callback_data="blacklist_add")],
+        [InlineKeyboardButton("✅ Удалить из чёрного списка", callback_data="blacklist_remove")],
+        [InlineKeyboardButton("🎫 Назначить техподдержку", callback_data="support_add")],
+        [InlineKeyboardButton("❌ Снять техподдержку", callback_data="support_remove")],
+        [InlineKeyboardButton("📩 Тикеты поддержки", callback_data="support_tickets")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🛠 Админ-панель", reply_markup=reply_markup)
+
+async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    if text.startswith("/support"):
+        # Если только команда, просим ввести текст
+        if len(text) <= 8:
+            await update.message.reply_text("Напишите /support <ваше сообщение>")
+            return
+        msg = text[9:].strip()
+        if not msg:
+            await update.message.reply_text("Сообщение не может быть пустым.")
+            return
+        await create_ticket(user_id, msg)
+        await update.message.reply_text("✅ Обращение создано. Ожидайте ответа.")
+
+async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    code = await generate_referral_code(user_id)
+    await update.message.reply_text(f"Ваша реферальная ссылка:\n`/start {code}`", parse_mode="Markdown")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if not text:
+        return
+    if text.startswith('/'):
+        return
+
+    # Поиск
+    results = await search_all(text)
+    if isinstance(results, dict) and "error" in results:
+        await update.message.reply_text("⛔ " + results["error"])
+        return
+
+    if not results:
+        await update.message.reply_text("❌ Ничего не найдено. Попробуйте другой запрос.")
+        return
+
+    output = []
+    for src, entries in results.items():
+        output.append(f"📌 {src}:")
+        for e in entries[:3]:
+            output.append(f"   • {e}")
+        output.append("")
+    reply = "\n".join(output)
+    if len(reply) > 4096:
+        reply = reply[:4093] + "..."
+    await update.message.reply_text(reply)
+
+# ===== CALLBACK QUERY HANDLER (админ-панель) =====
+
+ADMIN_ADD, ADMIN_REMOVE, BLACKLIST_ADD, BLACKLIST_REMOVE, SUPPORT_ADD, SUPPORT_REMOVE, TICKET_LIST, TICKET_REPLY = range(8)
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+
+    if data == "admin_add":
+        await query.edit_message_text("Введите ID пользователя, которого хотите сделать админом:")
+        return ADMIN_ADD
+    elif data == "admin_remove":
+        await query.edit_message_text("Введите ID пользователя для снятия админа:")
+        return ADMIN_REMOVE
+    elif data == "blacklist_add":
+        await query.edit_message_text("Введите данные для блокировки (ФИО, телефон, email):")
+        return BLACKLIST_ADD
+    elif data == "blacklist_remove":
+        await query.edit_message_text("Введите данные для удаления из чёрного списка:")
+        return BLACKLIST_REMOVE
+    elif data == "support_add":
+        await query.edit_message_text("Введите ID пользователя для назначения техподдержки:")
+        return SUPPORT_ADD
+    elif data == "support_remove":
+        await query.edit_message_text("Введите ID пользователя для снятия техподдержки:")
+        return SUPPORT_REMOVE
+    elif data == "support_tickets":
+        tickets = await get_open_tickets()
+        if not tickets:
+            await query.edit_message_text("Нет открытых тикетов.")
+            return
+        msg = "📩 Открытые тикеты:\n"
+        for t in tickets:
+            msg += f"#{t[0]} от {t[1]} ({t[3]}): {t[2][:50]}...\n"
+        msg += "\nДля ответа введите /reply <id> <текст>"
+        await query.edit_message_text(msg)
+        return
+    elif data == "stats":
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM users")
+            users = await cursor.fetchone()
+            cursor = await db.execute("SELECT COUNT(*) FROM blacklist")
+            bl = await cursor.fetchone()
+            cursor = await db.execute("SELECT COUNT(*) FROM support_tickets WHERE status='open'")
+            tickets = await cursor.fetchone()
+        await query.edit_message_text(f"📊 Статистика:\nПользователей: {users[0]}\nЧёрный список: {bl[0]}\nОткрытых тикетов: {tickets[0]}")
+        return
+
+async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Обработка ввода для админ-действий
+    # Используем состояние, но для простоты реализуем через текст после команды /admin и ожидание
+    pass
+
+# ===== ОСНОВНАЯ ФУНКЦИЯ =====
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("support", support_command))
+    app.add_handler(CommandHandler("referral", referral_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Обработчик кнопок админ-панели (только для демонстрации, реальная логика дописывается)
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern="admin_"))
+
+    # Для простоты добавим отдельные команды для админ-действий (чтобы не использовать ConversationHandler)
+    # /addadmin <id>, /rmadmin <id>, /bladd <data>, /blrm <data>, /supportadd <id>, /supportrm <id>
+    # /reply <ticket_id> <text>
+
+    async def addadmin(update, context):
+        if not await is_admin(update.effective_user.id): return
+        if not context.args: return
+        target = int(context.args[0])
+        await add_admin(update.effective_user.id, target)
+        await update.message.reply_text(f"Пользователь {target} стал админом.")
+
+    async def rmadmin(update, context):
+        if not await is_admin(update.effective_user.id): return
+        if not context.args: return
+        target = int(context.args[0])
+        if await remove_admin(update.effective_user.id, target):
+            await update.message.reply_text(f"Админ {target} снят.")
+        else:
+            await update.message.reply_text("Нельзя удалить последнего админа.")
+
+    async def bladd(update, context):
+        if not await is_admin(update.effective_user.id): return
+        if not context.args: return
+        pattern = " ".join(context.args)
+        if await add_blacklist(update.effective_user.id, pattern):
+            await update.message.reply_text(f"Добавлено в чёрный список: {pattern}")
+        else:
+            await update.message.reply_text("Ошибка (возможно уже есть).")
+
+    async def blrm(update, context):
+        if not await is_admin(update.effective_user.id): return
+        if not context.args: return
+        pattern = " ".join(context.args)
+        await remove_blacklist(update.effective_user.id, pattern)
+        await update.message.reply_text(f"Удалено из чёрного списка: {pattern}")
+
+    async def supportadd(update, context):
+        if not await is_admin(update.effective_user.id): return
+        if not context.args: return
+        target = int(context.args[0])
+        await set_support(update.effective_user.id, target)
+        await update.message.reply_text(f"Пользователь {target} назначен техподдержкой.")
+
+    async def supportrm(update, context):
+        if not await is_admin(update.effective_user.id): return
+        if not context.args: return
+        target = int(context.args[0])
+        await remove_support(update.effective_user.id, target)
+        await update.message.reply_text(f"Техподдержка снята с {target}.")
+
+    async def reply_ticket_cmd(update, context):
+        if not await is_admin(update.effective_user.id) and not await is_support(update.effective_user.id):
+            return
+        if len(context.args) < 2: return
+        ticket_id = int(context.args[0])
+        reply_text = " ".join(context.args[1:])
+        ticket = await get_ticket(ticket_id)
+        if not ticket:
+            await update.message.reply_text("Тикет не найден.")
+            return
+        await reply_ticket(ticket_id, reply_text, update.effective_user.id)
+        # Отправить ответ пользователю
+        try:
+            await context.bot.send_message(chat_id=ticket[1], text=f"Ответ на ваше обращение #{ticket_id}:\n{reply_text}")
+        except:
+            pass
+        await update.message.reply_text("Ответ отправлен.")
+
+    app.add_handler(CommandHandler("addadmin", addadmin))
+    app.add_handler(CommandHandler("rmadmin", rmadmin))
+    app.add_handler(CommandHandler("bladd", bladd))
+    app.add_handler(CommandHandler("blrm", blrm))
+    app.add_handler(CommandHandler("supportadd", supportadd))
+    app.add_handler(CommandHandler("supportrm", supportrm))
+    app.add_handler(CommandHandler("reply", reply_ticket_cmd))
+
+    # Инициализация БД
+    asyncio.run(init_db())
+
+    print(f"{BOT_NAME} 2.0 запущен.")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()

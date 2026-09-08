@@ -1,0 +1,1318 @@
+import os
+import logging
+import sqlite3
+import asyncio
+import random
+import aiohttp
+import json
+import re
+import difflib
+import zipfile
+import shutil
+import requests
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+
+# ===== КОНФИГ =====
+TOKEN = "8765988908:AAEPHusMMbv4CaxsUzDbHO7a6cwuxIEnK5A"   # замени на свой
+BOT_NAME = "Xloderia"
+DB_PATH = "xloderia.db"
+CACHE_TTL_HOURS = 24
+GITHUB_DB_URL = "https://github.com/ваш-репозиторий/архив/archive/main.zip"  # замени на свою ссылку
+LOCAL_DB_FOLDER = "custom_db"
+LOCAL_DB_FILE = None  # определится после распаковки
+
+logging.basicConfig(level=logging.INFO)
+start_time = datetime.now()
+user_states = {}
+
+# ============================================================
+# ===== БАЗА ДАННЫХ (основная) ================================
+# ============================================================
+def init_db_sync():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            registered_at TEXT,
+            referred_by INTEGER,
+            role TEXT DEFAULT 'user',
+            filter_type TEXT DEFAULT 'all'
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS blacklist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern TEXT UNIQUE,
+            added_by INTEGER,
+            added_at TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            message TEXT,
+            status TEXT DEFAULT 'open',
+            created_at TEXT,
+            assigned_to INTEGER,
+            reply TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS referrals (
+            referral_code TEXT PRIMARY KEY,
+            owner_id INTEGER,
+            used_by INTEGER,
+            used_at TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS cache (
+            query TEXT PRIMARY KEY,
+            results TEXT,
+            timestamp TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            query TEXT,
+            results TEXT,
+            timestamp TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER,
+            query TEXT,
+            PRIMARY KEY (user_id, query)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+async def run_sync(func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, func, *args, **kwargs)
+
+# ---- Функции БД (синхронные) ----
+def get_user_sync(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+async def get_user(user_id):
+    return await run_sync(get_user_sync, user_id)
+
+def get_user_by_username_sync(username):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id, username FROM users WHERE username=?", (username,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+async def get_user_by_username(username):
+    return await run_sync(get_user_by_username_sync, username)
+
+def register_user_sync(user_id, username, first_name, last_name, referred_by=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    if c.fetchone():
+        conn.close()
+        return False
+    c.execute("SELECT COUNT(*) FROM users")
+    count = c.fetchone()[0]
+    role = 'admin' if count == 0 else 'user'
+    c.execute(
+        "INSERT INTO users (user_id, username, first_name, last_name, registered_at, referred_by, role) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, username, first_name, last_name, datetime.now().isoformat(), referred_by, role)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+async def register_user(user_id, username, first_name, last_name, referred_by=None):
+    return await run_sync(register_user_sync, user_id, username, first_name, last_name, referred_by)
+
+def is_admin_sync(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row and row[0] == 'admin'
+
+async def is_admin(user_id):
+    return await run_sync(is_admin_sync, user_id)
+
+def is_support_sync(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row and row[0] == 'support'
+
+async def is_support(user_id):
+    return await run_sync(is_support_sync, user_id)
+
+def add_admin_sync(admin_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET role='admin' WHERE user_id=?", (admin_id,))
+    conn.commit()
+    conn.close()
+
+async def add_admin(admin_id):
+    await run_sync(add_admin_sync, admin_id)
+
+def remove_admin_sync(admin_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
+    count = c.fetchone()[0]
+    if count <= 1:
+        conn.close()
+        return False
+    c.execute("UPDATE users SET role='user' WHERE user_id=?", (admin_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+async def remove_admin(admin_id):
+    return await run_sync(remove_admin_sync, admin_id)
+
+def set_support_sync(target_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET role='support' WHERE user_id=?", (target_id,))
+    conn.commit()
+    conn.close()
+
+async def set_support(target_id):
+    await run_sync(set_support_sync, target_id)
+
+def remove_support_sync(target_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET role='user' WHERE user_id=?", (target_id,))
+    conn.commit()
+    conn.close()
+
+async def remove_support(target_id):
+    await run_sync(remove_support_sync, target_id)
+
+def add_blacklist_sync(pattern, admin_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO blacklist (pattern, added_by, added_at) VALUES (?, ?, ?)",
+                  (pattern, admin_id, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+
+async def add_blacklist(pattern, admin_id):
+    return await run_sync(add_blacklist_sync, pattern, admin_id)
+
+def remove_blacklist_sync(pattern):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM blacklist WHERE pattern=?", (pattern,))
+    conn.commit()
+    conn.close()
+
+async def remove_blacklist(pattern):
+    await run_sync(remove_blacklist_sync, pattern)
+
+def is_blacklisted_sync(pattern):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT pattern FROM blacklist WHERE pattern=?", (pattern,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+async def is_blacklisted(pattern):
+    return await run_sync(is_blacklisted_sync, pattern)
+
+def create_ticket_sync(user_id, message):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO support_tickets (user_id, message, created_at, status) VALUES (?, ?, ?, 'open')",
+        (user_id, message, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+async def create_ticket(user_id, message):
+    await run_sync(create_ticket_sync, user_id, message)
+
+def get_open_tickets_sync():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, message, created_at FROM support_tickets WHERE status='open' OR status='in_progress'")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+async def get_open_tickets():
+    return await run_sync(get_open_tickets_sync)
+
+def get_ticket_sync(ticket_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM support_tickets WHERE id=?", (ticket_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+async def get_ticket(ticket_id):
+    return await run_sync(get_ticket_sync, ticket_id)
+
+def reply_ticket_sync(ticket_id, reply_text, support_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE support_tickets SET reply=?, status='closed', assigned_to=? WHERE id=?",
+              (reply_text, support_id, ticket_id))
+    conn.commit()
+    conn.close()
+
+async def reply_ticket(ticket_id, reply_text, support_id):
+    await run_sync(reply_ticket_sync, ticket_id, reply_text, support_id)
+
+def get_user_tickets_sync(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, message, status, reply FROM support_tickets WHERE user_id=?", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+async def get_user_tickets(user_id):
+    return await run_sync(get_user_tickets_sync, user_id)
+
+def generate_referral_code_sync(user_id):
+    code = f"REF{random.randint(100000, 999999)}"
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO referrals (referral_code, owner_id) VALUES (?, ?)", (code, user_id))
+    conn.commit()
+    conn.close()
+    return code
+
+async def generate_referral_code(user_id):
+    return await run_sync(generate_referral_code_sync, user_id)
+
+def get_referral_owner_sync(code):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT owner_id FROM referrals WHERE referral_code=?", (code,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+async def get_referral_owner(code):
+    return await run_sync(get_referral_owner_sync, code)
+
+def use_referral_sync(code, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE referrals SET used_by=?, used_at=? WHERE referral_code=?",
+              (user_id, datetime.now().isoformat(), code))
+    conn.commit()
+    conn.close()
+
+async def use_referral(code, user_id):
+    await run_sync(use_referral_sync, code, user_id)
+
+def get_stats_sync():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    users = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM blacklist")
+    bl = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM support_tickets WHERE status='open'")
+    tickets = c.fetchone()[0]
+    conn.close()
+    return users, bl, tickets
+
+# ---- Фильтры и кэш ----
+def get_filter_sync(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT filter_type FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 'all'
+
+async def get_filter(user_id):
+    return await run_sync(get_filter_sync, user_id)
+
+def set_filter_sync(user_id, filter_type):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET filter_type=? WHERE user_id=?", (filter_type, user_id))
+    conn.commit()
+    conn.close()
+
+async def set_filter(user_id, filter_type):
+    await run_sync(set_filter_sync, user_id, filter_type)
+
+def save_cache_sync(query, results):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("REPLACE INTO cache (query, results, timestamp) VALUES (?, ?, ?)",
+              (query, json.dumps(results), datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+async def save_cache(query, results):
+    await run_sync(save_cache_sync, query, results)
+
+def get_cache_sync(query):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT results, timestamp FROM cache WHERE query=?", (query,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        timestamp = datetime.fromisoformat(row[1])
+        if datetime.now() - timestamp < timedelta(hours=CACHE_TTL_HOURS):
+            return json.loads(row[0])
+    return None
+
+async def get_cache(query):
+    return await run_sync(get_cache_sync, query)
+
+def save_history_sync(user_id, query, results):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO history (user_id, query, results, timestamp) VALUES (?, ?, ?, ?)",
+              (user_id, query, json.dumps(results), datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+async def save_history(user_id, query, results):
+    await run_sync(save_history_sync, user_id, query, results)
+
+def get_history_sync(user_id, limit=10):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT query, results, timestamp FROM history WHERE user_id=? ORDER BY timestamp DESC LIMIT ?",
+              (user_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+async def get_history(user_id, limit=10):
+    return await run_sync(get_history_sync, user_id, limit)
+
+def add_subscription_sync(user_id, query):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO subscriptions (user_id, query) VALUES (?, ?)", (user_id, query))
+    conn.commit()
+    conn.close()
+
+async def add_subscription(user_id, query):
+    await run_sync(add_subscription_sync, user_id, query)
+
+def get_subscriptions_sync():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id, query FROM subscriptions")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+async def get_subscriptions():
+    return await run_sync(get_subscriptions_sync)
+
+# ============================================================
+# ===== ЗАГРУЗКА ЛОКАЛЬНОЙ БД ИЗ GITHUB ======================
+# ============================================================
+async def download_and_extract_db(url=None):
+    if url is None:
+        url = GITHUB_DB_URL
+    if not url:
+        return None
+    global LOCAL_DB_FILE
+    if os.path.exists(LOCAL_DB_FOLDER):
+        shutil.rmtree(LOCAL_DB_FOLDER)
+    os.makedirs(LOCAL_DB_FOLDER, exist_ok=True)
+    try:
+        response = requests.get(url, stream=True)
+        if response.status_code != 200:
+            logging.error(f"Ошибка скачивания: {response.status_code}")
+            return None
+        zip_path = os.path.join(LOCAL_DB_FOLDER, "repo.zip")
+        with open(zip_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=1024):
+                if chunk:
+                    f.write(chunk)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(LOCAL_DB_FOLDER)
+        os.remove(zip_path)
+        for root, _, files in os.walk(LOCAL_DB_FOLDER):
+            for file in files:
+                if file.endswith(('.db', '.sqlite', '.sqlite3')):
+                    LOCAL_DB_FILE = os.path.join(root, file)
+                    logging.info(f"Найдена БД: {LOCAL_DB_FILE}")
+                    return LOCAL_DB_FILE
+        logging.warning("В архиве не найдено файлов БД.")
+        return None
+    except Exception as e:
+        logging.error(f"Ошибка загрузки/распаковки: {e}")
+        return None
+
+async def search_local_db(query: str) -> list:
+    if not LOCAL_DB_FILE or not os.path.exists(LOCAL_DB_FILE):
+        return []
+    query = query.strip().lower()
+    try:
+        conn = sqlite3.connect(LOCAL_DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = c.fetchall()
+        results = []
+        for (table_name,) in tables:
+            if table_name.startswith('sqlite_'):
+                continue
+            c.execute(f"PRAGMA table_info({table_name})")
+            columns = [col[1] for col in c.fetchall()]
+            for col in columns:
+                try:
+                    c.execute(f"SELECT * FROM {table_name} WHERE LOWER({col}) LIKE ?", (f'%{query}%',))
+                    rows = c.fetchall()
+                    if rows:
+                        for row in rows[:3]:
+                            row_str = " | ".join(str(v) for v in row)
+                            results.append(f"{table_name}.{col}: {row_str}")
+                        if len(results) >= 10:
+                            conn.close()
+                            return results[:10]
+                except:
+                    continue
+        conn.close()
+        return results[:10]
+    except Exception as e:
+        logging.error(f"Ошибка поиска в локальной БД: {e}")
+        return []
+
+# ============================================================
+# ===== ПОИСКОВЫЕ ИСТОЧНИКИ ===================================
+# ============================================================
+async def search_hibp(email: str) -> list:
+    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
+    headers = {"hibp-api-key": "", "User-Agent": "Xloderia/1.0"}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return [f"{b['Name']} ({b['BreachDate']}) — {', '.join(b['DataClasses'])}" for b in data]
+                elif resp.status == 404:
+                    return []
+                else:
+                    return []
+        except:
+            return []
+
+async def search_scylla(query: str) -> list:
+    url = "https://scylla.so/api/search"
+    params = {"q": query, "size": 3}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, params=params, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    results = data.get("results", [])
+                    if results:
+                        return [f"{r.get('source', 'unknown')}: {r.get('value', '')}" for r in results[:3]]
+                return []
+        except:
+            return []
+
+async def search_duckduckgo(query: str) -> list:
+    url = f"https://html.duckduckgo.com/html/?q={query}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    soup = BeautifulSoup(text, "html.parser")
+                    results = soup.find_all("a", class_="result__a")[:3]
+                    if results:
+                        return [f"DuckDuckGo: {r.get_text(strip=True)}" for r in results]
+                return []
+        except:
+            return []
+
+async def search_vk(query: str) -> list:
+    return [f"Поиск VK: https://vk.com/search?q={query}"]
+
+async def search_pastebin(query: str) -> list:
+    url = f"https://pastebin.com/search?q={query}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    return [f"Найдено на Pastebin (проверьте вручную): https://pastebin.com/search?q={query}"]
+                return []
+        except:
+            return []
+
+async def search_doxbin(query: str) -> list:
+    url = f"https://doxbin.com/search?q={query}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    soup = BeautifulSoup(text, "html.parser")
+                    items = soup.find_all("a", href=True)
+                    results = []
+                    for a in items:
+                        if "/post/" in a.get('href', ''):
+                            title = a.get_text(strip=True)
+                            if title and len(title) > 3:
+                                link = "https://doxbin.com" + a['href']
+                                results.append(f"{title} -> {link}")
+                    if results:
+                        return results[:5]
+                    else:
+                        return []
+                else:
+                    return []
+        except Exception as e:
+            return []
+
+async def search_leakcheck(query: str) -> list:
+    url = f"https://leak-check.net/api/public?q={query}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("found"):
+                        return [f"LeakCheck: {entry['type']}: {entry['value']}" for entry in data.get("results", [])]
+                return []
+        except:
+            return []
+
+async def search_telegram(query: str) -> list:
+    return []
+
+# ===== ОСНОВНАЯ ФУНКЦИЯ ПОИСКА =====
+async def search_all(query: str) -> dict:
+    query = query.strip()
+    if await is_blacklisted(query):
+        return {"error": "⛔ Данные скрыты администратором"}
+
+    cached = await get_cache(query)
+    if cached:
+        return cached
+
+    results = {}
+    tasks = [
+        ("Have I Been Pwned", search_hibp(query)),
+        ("Scylla.so", search_scylla(query)),
+        ("DuckDuckGo", search_duckduckgo(query)),
+        ("VK", search_vk(query)),
+        ("Pastebin", search_pastebin(query)),
+        ("Doxbin", search_doxbin(query)),
+        ("LeakCheck", search_leakcheck(query)),
+        ("Telegram", search_telegram(query))
+    ]
+
+    for name, coro in tasks:
+        res = await coro
+        if res:
+            results[name] = res
+
+    local_res = await search_local_db(query)
+    if local_res:
+        results["Локальная БД (GitHub)"] = local_res
+
+    if results:
+        await save_cache(query, results)
+    return results
+
+# ===== УМНЫЙ ПОИСК =====
+async def fuzzy_search(query: str) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT query FROM cache")
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return {}
+    queries = [q[0] for q in rows]
+    matches = difflib.get_close_matches(query, queries, n=1, cutoff=0.6)
+    if matches:
+        best_query = matches[0]
+        cached = await get_cache(best_query)
+        if cached:
+            return cached
+    return {}
+
+# ============================================================
+# ===== КЛАВИАТУРА ============================================
+# ============================================================
+async def get_main_keyboard(user_id=None):
+    keyboard = [
+        ["📋 Инфо о боте", "📊 Статус"],
+        ["❓ Помощь", "📩 Мои тикеты"],
+        ["📝 Создать тикет", "📜 История"],
+        ["⚙️ Настройки", "📤 Экспорт"],
+        ["🔔 Подписка"]
+    ]
+    if user_id and await is_admin(user_id):
+        keyboard.append(["🛠 Админ-панель"])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+# ============================================================
+# ===== ОБРАБОТЧИКИ ===========================================
+# ============================================================
+
+async def start_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = (
+        f"🔍 *Xloderia 4.9*\n"
+        "═══════════════════\n"
+        "Я ищу информацию в открытых источниках и локальной БД.\n"
+        "Отправь email, телефон или ФИО — я проверю.\n"
+        "Навигация через кнопки ниже.\n"
+        "═══════════════════\n"
+        "❗ Используй бота только в законных целях."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=await get_main_keyboard(user.id))
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    is_new = await register_user(
+        user_id,
+        update.effective_user.username,
+        update.effective_user.first_name,
+        update.effective_user.last_name
+    )
+    if is_new:
+        await start_message(update, context)
+    else:
+        await update.message.reply_text(
+            "Вы уже зарегистрированы. Используйте кнопки для навигации.",
+            reply_markup=await get_main_keyboard(user_id)
+        )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    if not text:
+        return
+
+    if text.startswith('/'):
+        return
+
+    # Обработка состояний
+    if user_id in user_states:
+        state = user_states[user_id]
+        action = state['action']
+        if action == 'awaiting_admin_add':
+            username = text.strip().lstrip('@')
+            user_data = await get_user_by_username(username)
+            if user_data:
+                target_id = user_data[0]
+                await add_admin(target_id)
+                await update.message.reply_text(f"✅ Пользователь @{username} стал админом.", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ Пользователь с таким username не найден.", reply_markup=await get_main_keyboard(user_id))
+            del user_states[user_id]
+            return
+        elif action == 'awaiting_admin_remove':
+            username = text.strip().lstrip('@')
+            user_data = await get_user_by_username(username)
+            if user_data:
+                target_id = user_data[0]
+                if await remove_admin(target_id):
+                    await update.message.reply_text(f"✅ Админ @{username} снят.", reply_markup=await get_main_keyboard(user_id))
+                else:
+                    await update.message.reply_text("❌ Нельзя удалить последнего админа.", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ Пользователь не найден.", reply_markup=await get_main_keyboard(user_id))
+            del user_states[user_id]
+            return
+        elif action == 'awaiting_blacklist_add':
+            pattern = text.strip()
+            if await add_blacklist(pattern, user_id):
+                await update.message.reply_text(f"✅ Добавлено в чёрный список: {pattern}", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ Ошибка (возможно уже есть).", reply_markup=await get_main_keyboard(user_id))
+            del user_states[user_id]
+            return
+        elif action == 'awaiting_blacklist_remove':
+            pattern = text.strip()
+            await remove_blacklist(pattern)
+            await update.message.reply_text(f"✅ Удалено из чёрного списка: {pattern}", reply_markup=await get_main_keyboard(user_id))
+            del user_states[user_id]
+            return
+        elif action == 'awaiting_support_add':
+            username = text.strip().lstrip('@')
+            user_data = await get_user_by_username(username)
+            if user_data:
+                target_id = user_data[0]
+                await set_support(target_id)
+                await update.message.reply_text(f"✅ Пользователь @{username} назначен техподдержкой.", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ Пользователь не найден.", reply_markup=await get_main_keyboard(user_id))
+            del user_states[user_id]
+            return
+        elif action == 'awaiting_support_remove':
+            username = text.strip().lstrip('@')
+            user_data = await get_user_by_username(username)
+            if user_data:
+                target_id = user_data[0]
+                await remove_support(target_id)
+                await update.message.reply_text(f"✅ Техподдержка снята с @{username}.", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ Пользователь не найден.", reply_markup=await get_main_keyboard(user_id))
+            del user_states[user_id]
+            return
+        elif action == 'awaiting_ticket_reply':
+            ticket_id = state['ticket_id']
+            reply_text = text.strip()
+            if reply_text:
+                await reply_ticket(ticket_id, reply_text, user_id)
+                ticket = await get_ticket(ticket_id)
+                if ticket:
+                    try:
+                        await context.bot.send_message(chat_id=ticket[1], text=f"Ответ на обращение #{ticket_id}:\n{reply_text}")
+                    except:
+                        pass
+                await update.message.reply_text(f"✅ Ответ на тикет #{ticket_id} отправлен.", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ Сообщение не может быть пустым.", reply_markup=await get_main_keyboard(user_id))
+            del user_states[user_id]
+            return
+        elif action == 'awaiting_ticket_creation':
+            msg_text = text.strip()
+            if msg_text:
+                await create_ticket(user_id, msg_text)
+                await update.message.reply_text("✅ Ваше обращение создано. Ожидайте ответа.", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ Сообщение не может быть пустым.", reply_markup=await get_main_keyboard(user_id))
+            del user_states[user_id]
+            return
+        elif action == 'awaiting_db_url':
+            url = text.strip()
+            if not url:
+                await update.message.reply_text("❌ Ссылка не может быть пустой.", reply_markup=await get_main_keyboard(user_id))
+                del user_states[user_id]
+                return
+            await update.message.reply_text("🔄 Загрузка и распаковка БД...", reply_markup=await get_main_keyboard(user_id))
+            result = await download_and_extract_db(url)
+            if result:
+                await update.message.reply_text(f"✅ База данных успешно загружена: {result}", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ Ошибка загрузки БД. Проверьте ссылку.", reply_markup=await get_main_keyboard(user_id))
+            del user_states[user_id]
+            return
+        else:
+            del user_states[user_id]
+
+    # Регистрация пользователя
+    is_new = await register_user(
+        user_id,
+        update.effective_user.username,
+        update.effective_user.first_name,
+        update.effective_user.last_name
+    )
+    if is_new:
+        await start_message(update, context)
+        return
+
+    # Кнопки
+    if text == "📋 Инфо о боте":
+        await info_command(update, context)
+    elif text == "📊 Статус":
+        await status_command(update, context)
+    elif text == "❓ Помощь":
+        await help_command(update, context)
+    elif text == "📩 Мои тикеты":
+        await my_tickets_command(update, context)
+    elif text == "📝 Создать тикет":
+        user_states[user_id] = {'action': 'awaiting_ticket_creation'}
+        await update.message.reply_text("✍️ Напишите текст вашего обращения в поддержку:")
+    elif text == "📜 История":
+        await history_command(update, context)
+    elif text == "⚙️ Настройки":
+        await settings_command(update, context)
+    elif text == "📤 Экспорт":
+        await export_command(update, context)
+    elif text == "🔔 Подписка":
+        await subscribe_command(update, context)
+    elif text == "🛠 Админ-панель":
+        if await is_admin(user_id):
+            await admin_panel(update, context)
+        else:
+            await update.message.reply_text("⛔ Доступ запрещён.", reply_markup=await get_main_keyboard(user_id))
+    else:
+        await perform_search(update, context, text)
+
+# ---- Обработчики функций ----
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = (
+        "ℹ️ *О боте Xloderia*\n\n"
+        "Бот ищет информацию в открытых источниках и локальной БД.\n"
+        "Все данные получены из легальных API и парсинга.\n"
+        "Владелец не несёт ответственности за использование полученной информации.\n"
+        "Используйте бота только в законных целях."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=await get_main_keyboard(user_id))
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    uptime = int((datetime.now() - start_time).total_seconds())
+    h = uptime // 3600
+    m = (uptime % 3600) // 60
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    users = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM cache")
+    cache_count = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM subscriptions")
+    subs = c.fetchone()[0]
+    conn.close()
+    text = (
+        f"📊 *Статус бота*\n"
+        f"⏱ Время работы: {h}ч {m}м\n"
+        f"👤 Пользователей: {users}\n"
+        f"💾 Кэш: {cache_count} записей\n"
+        f"🔔 Подписок: {subs}\n"
+        f"📂 Локальная БД: {'✅' if LOCAL_DB_FILE else '❌'}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=await get_main_keyboard(user_id))
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = (
+        "❓ *Помощь*\n\n"
+        "Отправьте любой текст — бот попытается найти информацию.\n"
+        "Кнопки:\n"
+        "• 📋 Инфо о боте – общая информация\n"
+        "• 📊 Статус – техническая статистика\n"
+        "• ❓ Помощь – эта справка\n"
+        "• 📩 Мои тикеты – ваши обращения в поддержку\n"
+        "• 📝 Создать тикет – новое обращение\n"
+        "• 📜 История – последние 10 запросов\n"
+        "• ⚙️ Настройки – смена фильтра (email/phone/name/all)\n"
+        "• 📤 Экспорт – выгрузка последнего результата в файл\n"
+        "• 🔔 Подписка – подписка на мониторинг запроса\n"
+        "• 🛠 Админ-панель – только для администратора"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=await get_main_keyboard(user_id))
+
+async def my_tickets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    tickets = await get_user_tickets(user_id)
+    if not tickets:
+        await update.message.reply_text("У вас нет обращений.", reply_markup=await get_main_keyboard(user_id))
+        return
+    msg = "📩 Ваши тикеты:\n"
+    for t in tickets:
+        status = t[2]
+        reply = t[3] if t[3] else "ожидает ответа"
+        msg += f"#{t[0]} [{status}]: {t[1][:30]}...\n   Ответ: {reply}\n"
+    await update.message.reply_text(msg[:4000], reply_markup=await get_main_keyboard(user_id))
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    history = await get_history(user_id)
+    if not history:
+        await update.message.reply_text("История поиска пуста.", reply_markup=await get_main_keyboard(user_id))
+        return
+    msg = "📜 *История поиска:*\n"
+    for i, (query, _, timestamp) in enumerate(history, 1):
+        msg += f"{i}. {query} ({timestamp})\n"
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=await get_main_keyboard(user_id))
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    current = await get_filter(user_id)
+    text = (
+        f"⚙️ *Настройки фильтра*\n\n"
+        f"Текущий фильтр: `{current}`\n\n"
+        "Выберите новый фильтр, отправив команду в чат:\n"
+        "• `filter all` – отключить фильтр\n"
+        "• `filter email` – показывать только email\n"
+        "• `filter phone` – показывать только телефоны\n"
+        "• `filter name` – показывать только ФИО\n\n"
+        "Просто напишите в чат, например: `filter phone`"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=await get_main_keyboard(user_id))
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    history = await get_history(user_id, 1)
+    if not history:
+        await update.message.reply_text("Нет результатов для экспорта.", reply_markup=await get_main_keyboard(user_id))
+        return
+    query, results_json, _ = history[0]
+    results = json.loads(results_json)
+    if not results:
+        await update.message.reply_text("Нет данных.", reply_markup=await get_main_keyboard(user_id))
+        return
+    text = f"Результаты поиска по запросу: {query}\n\n"
+    for src, entries in results.items():
+        text += f"📌 {src}:\n"
+        for e in entries:
+            text += f"   • {e}\n"
+        text += "\n"
+    with open("export.txt", "w", encoding="utf-8") as f:
+        f.write(text)
+    await update.message.reply_document(document=open("export.txt", "rb"), filename="export.txt", reply_markup=await get_main_keyboard(user_id))
+
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = (
+        "🔔 *Подписка на мониторинг*\n\n"
+        "Чтобы подписаться на обновления по запросу, отправьте в чат:\n"
+        "`subscribe <запрос>`\n\n"
+        "Например: `subscribe Иванов Иван`\n"
+        "Бот будет раз в сутки проверять новые данные и присылать уведомления."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=await get_main_keyboard(user_id))
+
+# ---- Поиск ----
+async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
+    user_id = update.effective_user.id
+    filter_type = await get_filter(user_id)
+
+    if query.lower().startswith("filter "):
+        parts = query.split(maxsplit=1)
+        if len(parts) > 1:
+            ft = parts[1].lower()
+            if ft in ['all', 'email', 'phone', 'name']:
+                await set_filter(user_id, ft)
+                await update.message.reply_text(f"✅ Фильтр установлен: {ft}", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ Неверный тип. Используйте: all, email, phone, name", reply_markup=await get_main_keyboard(user_id))
+        return
+    elif query.lower().startswith("subscribe "):
+        parts = query.split(maxsplit=1)
+        if len(parts) > 1:
+            sub_query = parts[1].strip()
+            if sub_query:
+                await add_subscription(user_id, sub_query)
+                await update.message.reply_text(f"✅ Вы подписались на мониторинг запроса: {sub_query}", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ Укажите запрос для подписки.", reply_markup=await get_main_keyboard(user_id))
+        return
+    else:
+        results = await search_all(query)
+        if "error" in results:
+            await update.message.reply_text(results["error"], reply_markup=await get_main_keyboard(user_id))
+            return
+
+        if not results:
+            results = await fuzzy_search(query)
+            if results:
+                await update.message.reply_text("🔍 Найдено похожее (умный поиск):", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ Ничего не найдено.", reply_markup=await get_main_keyboard(user_id))
+                return
+
+        if filter_type != 'all':
+            filtered = {}
+            for src, entries in results.items():
+                filtered_entries = []
+                for e in entries:
+                    if filter_type == 'email' and '@' in e:
+                        filtered_entries.append(e)
+                    elif filter_type == 'phone' and re.search(r'\+?\d{10,15}', e):
+                        filtered_entries.append(e)
+                    elif filter_type == 'name' and re.search(r'[А-Яа-я]+\s+[А-Яа-я]+', e):
+                        filtered_entries.append(e)
+                    else:
+                        continue
+                if filtered_entries:
+                    filtered[src] = filtered_entries
+            results = filtered
+
+        if not results:
+            await update.message.reply_text("❌ После фильтрации ничего не найдено.", reply_markup=await get_main_keyboard(user_id))
+            return
+
+        await save_history(user_id, query, results)
+
+        output = []
+        for src, entries in results.items():
+            output.append(f"📌 *{src}:*")
+            for e in entries:
+                output.append(f"   • {e}")
+            output.append("")
+        reply = "\n".join(output)
+        if len(reply) > 4096:
+            reply = reply[:4093] + "..."
+        await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=await get_main_keyboard(user_id))
+
+# ============================================================
+# ===== АДМИН-ПАНЕЛЬ (отдельные обработчики) =================
+# ============================================================
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await update.message.reply_text("⛔ Доступ запрещён.", reply_markup=await get_main_keyboard(user_id))
+        return
+    keyboard = [
+        [InlineKeyboardButton("👥 Добавить админа", callback_data="admin_add")],
+        [InlineKeyboardButton("🗑 Удалить админа", callback_data="admin_remove")],
+        [InlineKeyboardButton("⛔ Добавить в чёрный список", callback_data="blacklist_add")],
+        [InlineKeyboardButton("✅ Удалить из чёрного списка", callback_data="blacklist_remove")],
+        [InlineKeyboardButton("🎫 Назначить техподдержку", callback_data="support_add")],
+        [InlineKeyboardButton("❌ Снять техподдержку", callback_data="support_remove")],
+        [InlineKeyboardButton("📩 Тикеты поддержки", callback_data="support_tickets")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("📊 Статус бота", callback_data="admin_status")],
+        [InlineKeyboardButton("📥 Загрузить БД с GitHub", callback_data="admin_load_db")],
+        [InlineKeyboardButton("❓ Помощь по админке", callback_data="admin_help")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🛠 Админ-панель", reply_markup=reply_markup)
+
+# ---- Обработчики каждой кнопки ----
+async def admin_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    await query.edit_message_text("Введите @username пользователя, которого хотите сделать админом:")
+    user_states[user_id] = {'action': 'awaiting_admin_add'}
+
+async def admin_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    await query.edit_message_text("Введите @username пользователя для снятия прав админа:")
+    user_states[user_id] = {'action': 'awaiting_admin_remove'}
+
+async def blacklist_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    await query.edit_message_text("Введите текст (ФИО, телефон, email) для добавления в чёрный список:")
+    user_states[user_id] = {'action': 'awaiting_blacklist_add'}
+
+async def blacklist_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    await query.edit_message_text("Введите текст для удаления из чёрного списка:")
+    user_states[user_id] = {'action': 'awaiting_blacklist_remove'}
+
+async def support_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    await query.edit_message_text("Введите @username пользователя для назначения техподдержкой:")
+    user_states[user_id] = {'action': 'awaiting_support_add'}
+
+async def support_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    await query.edit_message_text("Введите @username пользователя для снятия техподдержки:")
+    user_states[user_id] = {'action': 'awaiting_support_remove'}
+
+async def support_tickets_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    tickets = await get_open_tickets()
+    if not tickets:
+        await query.edit_message_text("📭 Нет открытых тикетов.")
+        return
+    msg = "📩 Открытые тикеты:\n"
+    keyboard = []
+    for t in tickets:
+        msg += f"#{t[0]} от {t[1]} ({t[3]}): {t[2][:50]}...\n"
+        keyboard.append([InlineKeyboardButton(f"Ответить на тикет #{t[0]}", callback_data=f"reply_ticket_{t[0]}")])
+    msg += "\nВыберите тикет для ответа:"
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(msg, reply_markup=reply_markup)
+
+async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    users, bl, tickets = await run_sync(get_stats_sync)
+    await query.edit_message_text(
+        f"📊 *Статистика*\n👤 Пользователей: {users}\n⛔ В чёрном списке: {bl}\n📩 Открытых тикетов: {tickets}",
+        parse_mode="Markdown"
+    )
+
+async def admin_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    uptime = int((datetime.now() - start_time).total_seconds())
+    h = uptime // 3600
+    m = (uptime % 3600) // 60
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    users = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM cache")
+    cache_count = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM subscriptions")
+    subs = c.fetchone()[0]
+    conn.close()
+    text = (
+        f"📊 *Статус бота*\n"
+        f"⏱ Время работы: {h}ч {m}м\n"
+        f"👤 Пользователей: {users}\n"
+        f"💾 Кэш: {cache_count} записей\n"
+        f"🔔 Подписок: {subs}\n"
+        f"📂 Локальная БД: {'✅' if LOCAL_DB_FILE else '❌'}"
+    )
+    await query.edit_message_text(text, parse_mode="Markdown")
+
+async def admin_load_db_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    await query.edit_message_text("Введите прямую ссылку на ZIP-архив с базой данных (с GitHub или другого хостинга):")
+    user_states[user_id] = {'action': 'awaiting_db_url'}
+
+async def admin_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    help_text = (
+        "📖 *Помощь по админке*\n\n"
+        "• Добавить админа – запросит @username\n"
+        "• Удалить админа – запросит @username\n"
+        "• Добавить в чёрный список – запросит текст\n"
+        "• Удалить из чёрного списка – запросит текст\n"
+        "• Назначить техподдержку – запросит @username\n"
+        "• Снять техподдержку – запросит @username\n"
+        "• Тикеты поддержки – список открытых тикетов с кнопками ответа\n"
+        "• Статистика – общая статистика\n"
+        "• Статус бота – технический статус\n"
+        "• Загрузить БД с GitHub – скачивает архив, распаковывает и подключает SQLite-базу для поиска"
+    )
+    await query.edit_message_text(help_text, parse_mode="Markdown")
+
+async def reply_ticket_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+    data = query.data
+    ticket_id = int(data.split("_")[2])
+    await query.edit_message_text(f"Введите текст ответа на тикет #{ticket_id}:")
+    user_states[user_id] = {'action': 'awaiting_ticket_reply', 'ticket_id': ticket_id}
+
+# ============================================================
+# ===== ФОНОВЫЙ МОНИТОРИНГ =====================================
+# ============================================================
+async def monitor_task(application):
+    while True:
+        await asyncio.sleep(86400)
+        subscriptions = await get_subscriptions()
+        for user_id, query in subscriptions:
+            results = await search_all(query)
+            if results and "error" not in results:
+                try:
+                    await application.bot.send_message(
+                        chat_id=user_id,
+                        text=f"🔔 Новые данные по запросу '{query}':\n{json.dumps(results, indent=2, ensure_ascii=False)[:1000]}"
+                    )
+                except:
+                    pass
+
+# ============================================================
+# ===== ЗАПУСК ================================================
+# ============================================================
+if __name__ == "__main__":
+    init_db_sync()
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Регистрируем отдельные обработчики для каждой кнопки
+    app.add_handler(CallbackQueryHandler(admin_add_callback, pattern="^admin_add$"))
+    app.add_handler(CallbackQueryHandler(admin_remove_callback, pattern="^admin_remove$"))
+    app.add_handler(CallbackQueryHandler(blacklist_add_callback, pattern="^blacklist_add$"))
+    app.add_handler(CallbackQueryHandler(blacklist_remove_callback, pattern="^blacklist_remove$"))
+    app.add_handler(CallbackQueryHandler(support_add_callback, pattern="^support_add$"))
+    app.add_handler(CallbackQueryHandler(support_remove_callback, pattern="^support_remove$"))
+    app.add_handler(CallbackQueryHandler(support_tickets_callback, pattern="^support_tickets$"))
+    app.add_handler(CallbackQueryHandler(stats_callback, pattern="^stats$"))
+    app.add_handler(CallbackQueryHandler(admin_status_callback, pattern="^admin_status$"))
+    app.add_handler(CallbackQueryHandler(admin_load_db_callback, pattern="^admin_load_db$"))
+    app.add_handler(CallbackQueryHandler(admin_help_callback, pattern="^admin_help$"))
+    app.add_handler(CallbackQueryHandler(reply_ticket_callback, pattern="^reply_ticket_"))
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(monitor_task(app))
+
+    print(f"{BOT_NAME} 4.9 запущен (каждая кнопка админки имеет свой обработчик).")
+    app.run_polling()
